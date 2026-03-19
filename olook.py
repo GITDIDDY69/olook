@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""olook — Local Outlook CLI via COM automation. No cloud, no OAuth, no telemetry."""
+
+import datetime
+import io
+import json
+import os
+import subprocess
+import sys
+import time
+
+# Force UTF-8 stdout on Windows (cp1252 chokes on emoji folder names)
+if sys.stdout.encoding != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+import click
+import pythoncom
+import win32com.client
+
+
+# ── MAPI folder constants ──────────────────────────────────────────────
+
+FOLDER_MAP = {
+    "inbox": 6, "outbox": 4, "sent": 5, "deleted": 3,
+    "drafts": 16, "junk": 23, "calendar": 9, "contacts": 10,
+    "tasks": 13, "notes": 12,
+}
+
+
+# ── Outlook connection ─────────────────────────────────────────────────
+
+_OUTLOOK_PATHS = [
+    os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft Office", "root", "Office16", "OUTLOOK.EXE"),
+    os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft Office", "root", "Office16", "OUTLOOK.EXE"),
+    os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft Office", "Office16", "OUTLOOK.EXE"),
+]
+
+
+def _find_outlook_exe() -> str:
+    """Locate OUTLOOK.EXE on disk, fall back to PATH."""
+    for p in _OUTLOOK_PATHS:
+        if os.path.isfile(p):
+            return p
+    return "OUTLOOK.EXE"
+
+
+def _is_outlook_running() -> bool:
+    """Check if Outlook is registered in the COM Running Object Table."""
+    try:
+        pythoncom.CoInitialize()
+        win32com.client.GetActiveObject("Outlook.Application")
+        return True
+    except Exception:
+        return False
+
+
+def _launch_outlook_hidden():
+    """Start Outlook in COM-server mode (/embedding) with no visible window."""
+    exe = _find_outlook_exe()
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 6  # SW_MINIMIZE
+    subprocess.Popen(
+        [exe, "/embedding"],
+        startupinfo=startupinfo,
+        creationflags=subprocess.DETACHED_PROCESS,
+    )
+    for _ in range(30):  # poll up to 15s
+        time.sleep(0.5)
+        if _is_outlook_running():
+            return
+    raise click.ClickException("Outlook failed to start within 15 seconds")
+
+
+def get_outlook():
+    """Connect to a running Outlook instance, or silently launch one."""
+    pythoncom.CoInitialize()
+    try:
+        return win32com.client.GetActiveObject("Outlook.Application")
+    except Exception:
+        pass
+    _launch_outlook_hidden()
+    return win32com.client.GetActiveObject("Outlook.Application")
+
+
+# ── Helpers ────────────────────────────────────────────────────────────
+
+def get_folder(ns, folder_name: str):
+    """Resolve a folder by name ('Inbox') or path ('Inbox/Projects')."""
+    folder_name = folder_name.strip()
+    key = folder_name.lower().split("/")[0]
+    if key in FOLDER_MAP:
+        base = ns.GetDefaultFolder(FOLDER_MAP[key])
+        for part in folder_name.split("/")[1:]:
+            base = base.Folders[part]
+        return base
+    for store in ns.Stores:
+        try:
+            target = store.GetRootFolder()
+            for part in folder_name.split("/"):
+                target = target.Folders[part]
+            return target
+        except Exception:
+            continue
+    raise click.ClickException(f"Folder '{folder_name}' not found")
+
+
+def msg_to_dict(msg, body_len: int = 500) -> dict:
+    """Extract message fields into a plain dict."""
+    d = {}
+    for attr, default in [
+        ("Subject", ""), ("SenderName", ""), ("SenderEmailAddress", ""),
+        ("ReceivedTime", ""), ("EntryID", ""), ("UnRead", None),
+        ("FlagRequest", ""), ("Categories", ""), ("Importance", 1),
+        ("Size", 0), ("Attachments", None),
+    ]:
+        try:
+            val = getattr(msg, attr)
+            if attr == "ReceivedTime":
+                val = str(val)
+            elif attr == "Attachments":
+                val = val.Count if val else 0
+            d[attr] = val
+        except Exception:
+            d[attr] = default
+    if body_len > 0:
+        try:
+            d["Body"] = msg.Body[:body_len]
+        except Exception:
+            d["Body"] = ""
+    return d
+
+
+def format_msg(d: dict, compact: bool = False) -> str:
+    """Format a message dict for terminal output."""
+    if compact:
+        subj = d.get("Subject", "")[:60]
+        sender = d.get("SenderName", "")[:20]
+        date = d.get("ReceivedTime", "")[:19]
+        unread = "*" if d.get("UnRead") else " "
+        return f"[{unread}] {date}  {sender:<20}  {subj}"
+    lines = [
+        f"Subject: {d.get('Subject', '')}",
+        f"From: {d.get('SenderName', '')} <{d.get('SenderEmailAddress', '')}>",
+        f"Date: {d.get('ReceivedTime', '')}",
+        f"Unread: {d.get('UnRead', '')}",
+        f"Importance: {['Low', 'Normal', 'High'][d.get('Importance', 1)]}",
+        f"Categories: {d.get('Categories', '')}",
+        f"Flag: {d.get('FlagRequest', '')}",
+        f"Attachments: {d.get('Attachments', 0)}",
+        f"ID: {d.get('EntryID', '')}",
+    ]
+    if "Body" in d:
+        lines.append(f"Body: {d['Body']}")
+    return "\n".join(lines)
+
+
+def output(data, as_json: bool):
+    """Emit data as JSON or plain text."""
+    if as_json:
+        click.echo(json.dumps(data, indent=2, default=str))
+    elif isinstance(data, str):
+        click.echo(data)
+    elif isinstance(data, list):
+        click.echo("\n---\n".join(data) if data else "No results.")
+
+
+# ── CLI ────────────────────────────────────────────────────────────────
+
+@click.group()
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+@click.pass_context
+def cli(ctx, as_json):
+    """olook - Local Outlook CLI. Talks directly to Outlook Desktop via COM.
+
+    \b
+    No cloud APIs. No OAuth. No telemetry. Just your mailbox.
+    Requires: Windows, Outlook Desktop (classic), Python 3.8+, pywin32, click.
+    """
+    ctx.ensure_object(dict)
+    ctx.obj["json"] = as_json
+
+
+# ── Reading ────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("-n", "--count", default=10, help="Number of emails")
+@click.option("-f", "--folder", default="Inbox", help="Folder name or path")
+@click.pass_context
+def inbox(ctx, count, folder):
+    """List recent emails."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    fld = get_folder(ns, folder)
+    messages = fld.Items
+    messages.Sort("[ReceivedTime]", True)
+    results = []
+    for i, msg in enumerate(messages):
+        if i >= count:
+            break
+        try:
+            results.append(msg_to_dict(msg, body_len=0))
+        except Exception:
+            continue
+    if ctx.obj["json"]:
+        output(results, True)
+    else:
+        for d in results:
+            click.echo(format_msg(d, compact=True))
+        if not results:
+            click.echo("No emails found.")
+
+
+@cli.command()
+@click.argument("entry_id")
+@click.pass_context
+def read(ctx, entry_id):
+    """Read full email by EntryID."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    msg = ns.GetItemFromID(entry_id)
+    d = msg_to_dict(msg, body_len=0)
+    d["Body"] = msg.Body
+    if ctx.obj["json"]:
+        output(d, True)
+    else:
+        click.echo(format_msg(d))
+
+
+# ── Search ─────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("query")
+@click.option("-f", "--folder", default="Inbox")
+@click.option("-n", "--count", default=20)
+@click.option("--field", default="all", type=click.Choice(["subject", "body", "from", "all"]))
+@click.pass_context
+def search(ctx, query, folder, count, field):
+    """Search emails using Outlook's native DASL index."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    fld = get_folder(ns, folder)
+    q = query.replace("'", "''")
+    filters = {
+        "subject": f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{q}%'",
+        "body": f"@SQL=\"urn:schemas:httpmail:textdescription\" LIKE '%{q}%'",
+        "from": f"@SQL=\"urn:schemas:httpmail:fromemail\" LIKE '%{q}%' OR \"urn:schemas:httpmail:fromname\" LIKE '%{q}%'",
+        "all": f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{q}%' OR \"urn:schemas:httpmail:textdescription\" LIKE '%{q}%' OR \"urn:schemas:httpmail:fromname\" LIKE '%{q}%'",
+    }
+    items = fld.Items.Restrict(filters.get(field, filters["all"]))
+    items.Sort("[ReceivedTime]", True)
+    results = []
+    for i, msg in enumerate(items):
+        if i >= count:
+            break
+        try:
+            results.append(msg_to_dict(msg, 300))
+        except Exception:
+            continue
+    if ctx.obj["json"]:
+        output(results, True)
+    else:
+        for d in results:
+            click.echo(format_msg(d, compact=True))
+        if not results:
+            click.echo("No emails found.")
+
+
+# ── Composing ──────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--to", required=True, help="Recipient(s), semicolon-separated")
+@click.option("--subject", required=True)
+@click.option("--body", required=True)
+@click.option("--cc", default="")
+@click.option("--bcc", default="")
+def send(to, subject, body, cc, bcc):
+    """Send an email."""
+    ol = get_outlook()
+    mail = ol.CreateItem(0)
+    mail.To = to
+    mail.Subject = subject
+    mail.Body = body
+    if cc:
+        mail.CC = cc
+    if bcc:
+        mail.BCC = bcc
+    mail.Send()
+    click.echo(f"Sent to {to}")
+
+
+@cli.command()
+@click.argument("entry_id")
+@click.option("--body", required=True)
+@click.option("--all", "reply_all", is_flag=True, help="Reply to all recipients")
+def reply(entry_id, body, reply_all):
+    """Reply to an email by EntryID."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    msg = ns.GetItemFromID(entry_id)
+    r = msg.ReplyAll() if reply_all else msg.Reply()
+    r.Body = body + r.Body
+    r.Send()
+    click.echo(f"Reply sent ({'all' if reply_all else 'sender only'})")
+
+
+@cli.command()
+@click.argument("entry_id")
+@click.option("--to", required=True)
+@click.option("--body", default="")
+def forward(entry_id, to, body):
+    """Forward an email by EntryID."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    msg = ns.GetItemFromID(entry_id)
+    fwd = msg.Forward()
+    fwd.To = to
+    if body:
+        fwd.Body = body + fwd.Body
+    fwd.Send()
+    click.echo(f"Forwarded to {to}")
+
+
+# ── Organizing ─────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("entry_id")
+@click.option("--to", "dest", required=True, help="Destination folder")
+def move(entry_id, dest):
+    """Move an email to another folder."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    msg = ns.GetItemFromID(entry_id)
+    target = get_folder(ns, dest)
+    msg.Move(target)
+    click.echo(f"Moved to {dest}")
+
+
+@cli.command()
+@click.argument("entry_id")
+@click.option("--text", default="Follow up")
+def flag(entry_id, text):
+    """Flag an email for follow-up."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    msg = ns.GetItemFromID(entry_id)
+    msg.FlagRequest = text
+    msg.Save()
+    click.echo(f"Flagged: {text}")
+
+
+@cli.command("mark-read")
+@click.argument("entry_id")
+@click.option("--unread", is_flag=True, help="Mark as unread instead")
+def mark_read(entry_id, unread):
+    """Mark an email as read (or --unread)."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    msg = ns.GetItemFromID(entry_id)
+    msg.UnRead = unread
+    msg.Save()
+    click.echo(f"Marked as {'unread' if unread else 'read'}")
+
+
+@cli.command("categorize")
+@click.argument("entry_id")
+@click.option("--categories", required=True, help="Comma-separated categories")
+def categorize(entry_id, categories):
+    """Set categories on an email."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    msg = ns.GetItemFromID(entry_id)
+    msg.Categories = categories
+    msg.Save()
+    click.echo(f"Categories set: {categories}")
+
+
+# ── Folders ────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--root", default="", help="Start from a specific folder")
+@click.pass_context
+def folders(ctx, root):
+    """List the mail folder tree."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    lines = []
+
+    def walk(folder, prefix=""):
+        try:
+            lines.append(f"{prefix}{folder.Name} ({folder.Items.Count})")
+            for i in range(folder.Folders.Count):
+                walk(folder.Folders.Item(i + 1), prefix + "  ")
+        except Exception:
+            pass
+
+    if root:
+        walk(get_folder(ns, root))
+    else:
+        for store in ns.Stores:
+            try:
+                lines.append(f"[{store.DisplayName}]")
+                rf = store.GetRootFolder()
+                for i in range(rf.Folders.Count):
+                    walk(rf.Folders.Item(i + 1), "  ")
+            except Exception:
+                continue
+    click.echo("\n".join(lines) if lines else "No folders found.")
+
+
+@cli.command()
+@click.option("-f", "--folder", default="Inbox")
+def unread(folder):
+    """Show unread count for a folder."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    fld = get_folder(ns, folder)
+    click.echo(f"{fld.UnReadItemCount} unread in {folder}")
+
+
+# ── Stats ──────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("-f", "--folder", default="Inbox")
+@click.pass_context
+def stats(ctx, folder):
+    """Folder statistics: total, unread, top senders."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    fld = get_folder(ns, folder)
+    messages = fld.Items
+    messages.Sort("[ReceivedTime]", True)
+    total = fld.Items.Count
+    unread_ct = fld.UnReadItemCount
+    senders = {}
+    oldest = newest = None
+    count = 0
+    for msg in messages:
+        if count >= 500:
+            break
+        try:
+            name = msg.SenderName
+            senders[name] = senders.get(name, 0) + 1
+            dt = str(msg.ReceivedTime)
+            if newest is None:
+                newest = dt
+            oldest = dt
+            count += 1
+        except Exception:
+            continue
+    top = sorted(senders.items(), key=lambda x: -x[1])[:10]
+    info = {
+        "folder": folder, "total": total, "unread": unread_ct,
+        "sampled": count, "newest": newest, "oldest": oldest,
+        "top_senders": dict(top),
+    }
+    if ctx.obj["json"]:
+        output(info, True)
+    else:
+        click.echo(f"Folder: {folder}")
+        click.echo(f"Total: {total}  Unread: {unread_ct}")
+        click.echo(f"Newest: {newest}")
+        click.echo(f"Oldest: {oldest}")
+        click.echo("Top senders:")
+        for name, c in top:
+            click.echo(f"  {name}: {c}")
+
+
+# ── Scrape ─────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("-f", "--folder", default="Inbox")
+@click.option("-n", "--count", default=100)
+@click.option("--fields", default="subject,from,date",
+              help="Comma-separated: subject,from,date,unread,categories,flag,importance,size,id,attachments")
+@click.pass_context
+def scrape(ctx, folder, count, fields):
+    """Bulk export selected fields from a folder."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    fld = get_folder(ns, folder)
+    messages = fld.Items
+    messages.Sort("[ReceivedTime]", True)
+    field_list = [f.strip().lower() for f in fields.split(",")]
+    attr_map = {
+        "subject": "Subject", "from": "SenderName", "date": "ReceivedTime",
+        "unread": "UnRead", "categories": "Categories", "flag": "FlagRequest",
+        "importance": "Importance", "size": "Size", "id": "EntryID",
+        "attachments": "Attachments",
+    }
+    rows = []
+    for i, msg in enumerate(messages):
+        if i >= count:
+            break
+        try:
+            row = {}
+            for f in field_list:
+                attr = attr_map.get(f)
+                if not attr:
+                    continue
+                val = getattr(msg, attr, "")
+                if attr == "ReceivedTime":
+                    val = str(val)
+                elif attr == "Attachments":
+                    val = val.Count if val else 0
+                elif attr == "Importance":
+                    val = ["Low", "Normal", "High"][val]
+                else:
+                    val = str(val)
+                row[f] = val
+            rows.append(row)
+        except Exception:
+            continue
+    if ctx.obj["json"]:
+        output(rows, True)
+    else:
+        for row in rows:
+            click.echo(" | ".join(f"{k}={v}" for k, v in row.items()))
+        if not rows:
+            click.echo("No emails found.")
+
+
+# ── Calendar ───────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("-d", "--days", default=7, help="Days ahead to show")
+@click.pass_context
+def cal(ctx, days):
+    """Show upcoming calendar events."""
+    ol = get_outlook()
+    ns = ol.GetNamespace("MAPI")
+    calendar = ns.GetDefaultFolder(9)
+    items = calendar.Items
+    items.IncludeRecurrences = True
+    items.Sort("[Start]")
+    now = datetime.datetime.now()
+    end = now + datetime.timedelta(days=days)
+    restrict = f"[Start] >= '{now.strftime('%m/%d/%Y')}' AND [Start] <= '{end.strftime('%m/%d/%Y')}'"
+    filtered = items.Restrict(restrict)
+    results = []
+    for item in filtered:
+        try:
+            evt = {
+                "subject": item.Subject,
+                "start": str(item.Start),
+                "end": str(item.End),
+                "location": item.Location,
+                "body": str(item.Body)[:200],
+            }
+            results.append(evt)
+        except Exception:
+            continue
+    if ctx.obj["json"]:
+        output(results, True)
+    else:
+        for e in results:
+            click.echo(f"  {e['start'][:16]}  {e['subject']}")
+            if e["location"]:
+                click.echo(f"    @ {e['location']}")
+        if not results:
+            click.echo("No upcoming events.")
+
+
+@cli.command("cal-add")
+@click.option("--subject", required=True)
+@click.option("--start", required=True, help="YYYY-MM-DD HH:MM")
+@click.option("--end", required=True, help="YYYY-MM-DD HH:MM")
+@click.option("--location", default="")
+@click.option("--body", default="")
+def cal_add(subject, start, end, location, body):
+    """Create a calendar event."""
+    ol = get_outlook()
+    item = ol.CreateItem(1)
+    item.Subject = subject
+    item.Start = start
+    item.End = end
+    if location:
+        item.Location = location
+    if body:
+        item.Body = body
+    item.Save()
+    click.echo(f"Event created: {subject}")
+
+
+# ── Ghost Mode ─────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("action", type=click.Choice(["install", "remove", "status"]))
+def ghost(action):
+    """Manage Outlook ghost mode (hidden startup on login).
+
+    \b
+    install  - Register a scheduled task to start Outlook hidden at logon
+    remove   - Remove the scheduled task
+    status   - Check if ghost mode is active
+    """
+    task_name = "OlookGhostOutlook"
+    exe = _find_outlook_exe()
+
+    if action == "install":
+        cmd = (
+            f'schtasks /create /tn "{task_name}" /tr "\\"{exe}\\" /embedding" '
+            f'/sc onlogon /rl limited /f'
+        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0:
+            click.echo("Ghost mode installed. Outlook will start hidden at logon.")
+            click.echo(f"  Task: {task_name}")
+            click.echo(f"  Exe:  {exe}")
+        else:
+            raise click.ClickException(f"Failed to create task: {result.stderr.strip()}")
+
+    elif action == "remove":
+        result = subprocess.run(
+            f'schtasks /delete /tn "{task_name}" /f',
+            shell=True, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            click.echo("Ghost mode removed.")
+        else:
+            click.echo("Ghost mode was not installed (or already removed).")
+
+    elif action == "status":
+        result = subprocess.run(
+            f'schtasks /query /tn "{task_name}" /fo csv /nh',
+            shell=True, capture_output=True, text=True,
+        )
+        running = "YES" if _is_outlook_running() else "NO"
+        if result.returncode == 0 and task_name in result.stdout:
+            click.echo("Ghost mode: ACTIVE")
+        else:
+            click.echo("Ghost mode: NOT INSTALLED")
+        click.echo(f"Outlook running: {running}")
+
+
+# ── Entry point ────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    cli()
