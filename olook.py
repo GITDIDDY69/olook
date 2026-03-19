@@ -95,15 +95,19 @@ def get_folder(ns, folder_name: str):
         for part in folder_name.split("/")[1:]:
             base = base.Folders[part]
         return base
+    errors = []
     for store in ns.Stores:
         try:
             target = store.GetRootFolder()
             for part in folder_name.split("/"):
                 target = target.Folders[part]
             return target
-        except Exception:
+        except Exception as e:
+            errors.append(f"  [{store.DisplayName}]: {e}")
             continue
-    raise click.ClickException(f"Folder '{folder_name}' not found")
+    detail = "\n".join(errors) if errors else ""
+    raise click.ClickException(f"Folder '{folder_name}' not found\n{detail}" if detail
+                               else f"Folder '{folder_name}' not found")
 
 
 def msg_to_dict(msg, body_len: int = 500) -> dict:
@@ -214,14 +218,15 @@ def inbox(ctx, count, folder):
 
 @cli.command()
 @click.argument("entry_id")
+@click.option("--body-limit", default=0, help="Max body chars (0 = unlimited)")
 @click.pass_context
-def read(ctx, entry_id):
+def read(ctx, entry_id, body_limit):
     """Read full email by EntryID."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
     msg = ns.GetItemFromID(entry_id)
     d = msg_to_dict(msg, body_len=0)
-    d["Body"] = msg.Body
+    d["Body"] = msg.Body[:body_limit] if body_limit > 0 else msg.Body
     if ctx.obj["json"]:
         output(d, True)
     else:
@@ -275,7 +280,8 @@ def search(ctx, query, folder, count, field):
 @click.option("--body", required=True)
 @click.option("--cc", default="")
 @click.option("--bcc", default="")
-def send(to, subject, body, cc, bcc):
+@click.pass_context
+def send(ctx, to, subject, body, cc, bcc):
     """Send an email."""
     ol = get_outlook()
     mail = ol.CreateItem(0)
@@ -287,29 +293,41 @@ def send(to, subject, body, cc, bcc):
     if bcc:
         mail.BCC = bcc
     mail.Send()
-    click.echo(f"Sent to {to}")
+    result = {"status": "sent", "to": to, "subject": subject}
+    output(result, ctx.obj["json"]) if ctx.obj["json"] else click.echo(f"Sent to {to}")
 
 
 @cli.command()
 @click.argument("entry_id")
 @click.option("--body", required=True)
 @click.option("--all", "reply_all", is_flag=True, help="Reply to all recipients")
-def reply(entry_id, body, reply_all):
+@click.pass_context
+def reply(ctx, entry_id, body, reply_all):
     """Reply to an email by EntryID."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
     msg = ns.GetItemFromID(entry_id)
     r = msg.ReplyAll() if reply_all else msg.Reply()
-    r.Body = body + r.Body
+    # Preserve HTML formatting if original is HTML (BodyFormat 2)
+    try:
+        if msg.BodyFormat == 2:  # olFormatHTML
+            r.HTMLBody = f"<p>{body}</p>" + r.HTMLBody
+        else:
+            r.Body = body + r.Body
+    except Exception:
+        r.Body = body + r.Body
     r.Send()
-    click.echo(f"Reply sent ({'all' if reply_all else 'sender only'})")
+    mode = "all" if reply_all else "sender only"
+    result = {"status": "replied", "mode": mode, "entry_id": entry_id}
+    output(result, ctx.obj["json"]) if ctx.obj["json"] else click.echo(f"Reply sent ({mode})")
 
 
 @cli.command()
 @click.argument("entry_id")
 @click.option("--to", required=True)
 @click.option("--body", default="")
-def forward(entry_id, to, body):
+@click.pass_context
+def forward(ctx, entry_id, to, body):
     """Forward an email by EntryID."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
@@ -317,9 +335,16 @@ def forward(entry_id, to, body):
     fwd = msg.Forward()
     fwd.To = to
     if body:
-        fwd.Body = body + fwd.Body
+        try:
+            if msg.BodyFormat == 2:  # olFormatHTML
+                fwd.HTMLBody = f"<p>{body}</p>" + fwd.HTMLBody
+            else:
+                fwd.Body = body + fwd.Body
+        except Exception:
+            fwd.Body = body + fwd.Body
     fwd.Send()
-    click.echo(f"Forwarded to {to}")
+    result = {"status": "forwarded", "to": to, "entry_id": entry_id}
+    output(result, ctx.obj["json"]) if ctx.obj["json"] else click.echo(f"Forwarded to {to}")
 
 
 # ── Organizing ─────────────────────────────────────────────────────────
@@ -327,53 +352,62 @@ def forward(entry_id, to, body):
 @cli.command()
 @click.argument("entry_id")
 @click.option("--to", "dest", required=True, help="Destination folder")
-def move(entry_id, dest):
+@click.pass_context
+def move(ctx, entry_id, dest):
     """Move an email to another folder."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
     msg = ns.GetItemFromID(entry_id)
     target = get_folder(ns, dest)
     msg.Move(target)
-    click.echo(f"Moved to {dest}")
+    result = {"status": "moved", "destination": dest, "entry_id": entry_id}
+    output(result, ctx.obj["json"]) if ctx.obj["json"] else click.echo(f"Moved to {dest}")
 
 
 @cli.command()
 @click.argument("entry_id")
 @click.option("--text", default="Follow up")
-def flag(entry_id, text):
+@click.pass_context
+def flag(ctx, entry_id, text):
     """Flag an email for follow-up."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
     msg = ns.GetItemFromID(entry_id)
     msg.FlagRequest = text
     msg.Save()
-    click.echo(f"Flagged: {text}")
+    result = {"status": "flagged", "flag": text, "entry_id": entry_id}
+    output(result, ctx.obj["json"]) if ctx.obj["json"] else click.echo(f"Flagged: {text}")
 
 
 @cli.command("mark-read")
 @click.argument("entry_id")
 @click.option("--unread", is_flag=True, help="Mark as unread instead")
-def mark_read(entry_id, unread):
+@click.pass_context
+def mark_read(ctx, entry_id, unread):
     """Mark an email as read (or --unread)."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
     msg = ns.GetItemFromID(entry_id)
     msg.UnRead = unread
     msg.Save()
-    click.echo(f"Marked as {'unread' if unread else 'read'}")
+    state = "unread" if unread else "read"
+    result = {"status": state, "entry_id": entry_id}
+    output(result, ctx.obj["json"]) if ctx.obj["json"] else click.echo(f"Marked as {state}")
 
 
 @cli.command("categorize")
 @click.argument("entry_id")
 @click.option("--categories", required=True, help="Comma-separated categories")
-def categorize(entry_id, categories):
+@click.pass_context
+def categorize(ctx, entry_id, categories):
     """Set categories on an email."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
     msg = ns.GetItemFromID(entry_id)
     msg.Categories = categories
     msg.Save()
-    click.echo(f"Categories set: {categories}")
+    result = {"status": "categorized", "categories": categories, "entry_id": entry_id}
+    output(result, ctx.obj["json"]) if ctx.obj["json"] else click.echo(f"Categories set: {categories}")
 
 
 # ── Folders ────────────────────────────────────────────────────────────
@@ -536,7 +570,8 @@ def cal(ctx, days):
     items.Sort("[Start]")
     now = datetime.datetime.now()
     end = now + datetime.timedelta(days=days)
-    restrict = f"[Start] >= '{now.strftime('%m/%d/%Y')}' AND [Start] <= '{end.strftime('%m/%d/%Y')}'"
+    restrict = (f"[Start] >= '{now.strftime('%m/%d/%Y %I:%M %p')}'"
+                f" AND [Start] <= '{end.strftime('%m/%d/%Y %I:%M %p')}'")
     filtered = items.Restrict(restrict)
     results = []
     for item in filtered:
@@ -568,7 +603,8 @@ def cal(ctx, days):
 @click.option("--end", required=True, help="YYYY-MM-DD HH:MM")
 @click.option("--location", default="")
 @click.option("--body", default="")
-def cal_add(subject, start, end, location, body):
+@click.pass_context
+def cal_add(ctx, subject, start, end, location, body):
     """Create a calendar event."""
     ol = get_outlook()
     item = ol.CreateItem(1)
@@ -580,7 +616,8 @@ def cal_add(subject, start, end, location, body):
     if body:
         item.Body = body
     item.Save()
-    click.echo(f"Event created: {subject}")
+    result = {"status": "created", "subject": subject, "start": start, "end": end}
+    output(result, ctx.obj["json"]) if ctx.obj["json"] else click.echo(f"Event created: {subject}")
 
 
 # ── Ghost Mode ─────────────────────────────────────────────────────────
@@ -599,11 +636,12 @@ def ghost(action):
     exe = _find_outlook_exe()
 
     if action == "install":
-        cmd = (
-            f'schtasks /create /tn "{task_name}" /tr "\\"{exe}\\" /embedding" '
-            f'/sc onlogon /rl limited /f'
+        result = subprocess.run(
+            ["schtasks", "/create", "/tn", task_name,
+             "/tr", f'"{exe}" /embedding',
+             "/sc", "onlogon", "/rl", "limited", "/f"],
+            capture_output=True, text=True,
         )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         if result.returncode == 0:
             click.echo("Ghost mode installed. Outlook will start hidden at logon.")
             click.echo(f"  Task: {task_name}")
@@ -613,8 +651,8 @@ def ghost(action):
 
     elif action == "remove":
         result = subprocess.run(
-            f'schtasks /delete /tn "{task_name}" /f',
-            shell=True, capture_output=True, text=True,
+            ["schtasks", "/delete", "/tn", task_name, "/f"],
+            capture_output=True, text=True,
         )
         if result.returncode == 0:
             click.echo("Ghost mode removed.")
@@ -623,8 +661,8 @@ def ghost(action):
 
     elif action == "status":
         result = subprocess.run(
-            f'schtasks /query /tn "{task_name}" /fo csv /nh',
-            shell=True, capture_output=True, text=True,
+            ["schtasks", "/query", "/tn", task_name, "/fo", "csv", "/nh"],
+            capture_output=True, text=True,
         )
         running = "YES" if _is_outlook_running() else "NO"
         if result.returncode == 0 and task_name in result.stdout:
