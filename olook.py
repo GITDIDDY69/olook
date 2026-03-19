@@ -5,6 +5,7 @@ import datetime
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -17,6 +18,44 @@ if sys.stdout.encoding != "utf-8":
 import click
 import pythoncom
 import win32com.client
+
+
+# ── Security: output sanitization ──────────────────────────────────────
+# Email content is untrusted. Sanitize before terminal display to prevent
+# ANSI escape injection, bidi spoofing, and control character attacks.
+
+_ANSI_RE = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+_BIDI_CHARS = set('\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e'
+                  '\u2066\u2067\u2068\u2069\ufeff')
+
+
+def _sanitize(s: str) -> str:
+    """Strip ANSI escapes, bidi overrides, and C0/C1 control chars from untrusted content."""
+    if not isinstance(s, str):
+        return str(s)
+    s = _ANSI_RE.sub('', s)
+    s = ''.join(c for c in s if c not in _BIDI_CHARS)
+    # Strip C0 controls except tab (\x09) and newline (\x0a)
+    s = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', s)
+    return s
+
+
+def _sanitize_dict(d: dict) -> dict:
+    """Sanitize all string values in a message dict."""
+    return {k: _sanitize(v) if isinstance(v, str) else v for k, v in d.items()}
+
+
+_ENTRYID_RE = re.compile(r'^[0-9A-Fa-f]{32,}$')
+
+
+def _validate_entry_id(entry_id: str) -> str:
+    """Validate that an EntryID looks like a hex MAPI identifier."""
+    entry_id = entry_id.strip()
+    if not _ENTRYID_RE.match(entry_id):
+        raise click.BadParameter(
+            f"Invalid EntryID format (expected hex string, got {len(entry_id)} chars)"
+        )
+    return entry_id
 
 
 # ── MAPI folder constants ──────────────────────────────────────────────
@@ -38,11 +77,18 @@ _OUTLOOK_PATHS = [
 
 
 def _find_outlook_exe() -> str:
-    """Locate OUTLOOK.EXE on disk, fall back to PATH."""
+    """Locate OUTLOOK.EXE on disk. Fails if not found (no PATH fallback to avoid hijack)."""
+    # Allow explicit override via environment variable
+    env_exe = os.environ.get("OLOOK_OUTLOOK_EXE")
+    if env_exe and os.path.isfile(env_exe):
+        return env_exe
     for p in _OUTLOOK_PATHS:
         if os.path.isfile(p):
             return p
-    return "OUTLOOK.EXE"
+    raise click.ClickException(
+        "OUTLOOK.EXE not found at standard Office paths. "
+        "Set OLOOK_OUTLOOK_EXE environment variable to specify the path."
+    )
 
 
 def _is_outlook_running() -> bool:
@@ -95,19 +141,19 @@ def get_folder(ns, folder_name: str):
         for part in folder_name.split("/")[1:]:
             base = base.Folders[part]
         return base
-    errors = []
+    store_count = 0
     for store in ns.Stores:
+        store_count += 1
         try:
             target = store.GetRootFolder()
             for part in folder_name.split("/"):
                 target = target.Folders[part]
             return target
-        except Exception as e:
-            errors.append(f"  [{store.DisplayName}]: {e}")
+        except Exception:
             continue
-    detail = "\n".join(errors) if errors else ""
-    raise click.ClickException(f"Folder '{folder_name}' not found\n{detail}" if detail
-                               else f"Folder '{folder_name}' not found")
+    raise click.ClickException(
+        f"Folder '{folder_name}' not found (searched {store_count} store(s))"
+    )
 
 
 def msg_to_dict(msg, body_len: int = 500) -> dict:
@@ -133,7 +179,7 @@ def msg_to_dict(msg, body_len: int = 500) -> dict:
             d["Body"] = msg.Body[:body_len]
         except Exception:
             d["Body"] = ""
-    return d
+    return _sanitize_dict(d)
 
 
 def format_msg(d: dict, compact: bool = False) -> str:
@@ -160,8 +206,19 @@ def format_msg(d: dict, compact: bool = False) -> str:
     return "\n".join(lines)
 
 
+_PIPED_WARNING_SHOWN = False
+
+
 def output(data, as_json: bool):
-    """Emit data as JSON or plain text."""
+    """Emit data as JSON or plain text. Warns when piped to signal untrusted content."""
+    global _PIPED_WARNING_SHOWN
+    if not sys.stdout.isatty() and not _PIPED_WARNING_SHOWN:
+        click.echo(
+            "# OLOOK WARNING: Output contains untrusted email content. "
+            "Do not feed to an LLM without a trust boundary.",
+            err=True,
+        )
+        _PIPED_WARNING_SHOWN = True
     if as_json:
         click.echo(json.dumps(data, indent=2, default=str))
     elif isinstance(data, str):
@@ -224,9 +281,10 @@ def read(ctx, entry_id, body_limit):
     """Read full email by EntryID."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
-    msg = ns.GetItemFromID(entry_id)
+    msg = ns.GetItemFromID(_validate_entry_id(entry_id))
     d = msg_to_dict(msg, body_len=0)
-    d["Body"] = msg.Body[:body_limit] if body_limit > 0 else msg.Body
+    raw_body = msg.Body[:body_limit] if body_limit > 0 else msg.Body
+    d["Body"] = _sanitize(raw_body)
     if ctx.obj["json"]:
         output(d, True)
     else:
@@ -246,7 +304,9 @@ def search(ctx, query, folder, count, field):
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
     fld = get_folder(ns, folder)
-    q = query.replace("'", "''")
+    if re.search(r'[\x00-\x1f\x7f]', query):
+        raise click.BadParameter("Query contains control characters")
+    q = query.replace("'", "''").replace("%", "[%]").replace("_", "[_]")
     filters = {
         "subject": f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{q}%'",
         "body": f"@SQL=\"urn:schemas:httpmail:textdescription\" LIKE '%{q}%'",
@@ -306,7 +366,7 @@ def reply(ctx, entry_id, body, reply_all):
     """Reply to an email by EntryID."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
-    msg = ns.GetItemFromID(entry_id)
+    msg = ns.GetItemFromID(_validate_entry_id(entry_id))
     r = msg.ReplyAll() if reply_all else msg.Reply()
     # Preserve HTML formatting if original is HTML (BodyFormat 2)
     try:
@@ -331,7 +391,7 @@ def forward(ctx, entry_id, to, body):
     """Forward an email by EntryID."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
-    msg = ns.GetItemFromID(entry_id)
+    msg = ns.GetItemFromID(_validate_entry_id(entry_id))
     fwd = msg.Forward()
     fwd.To = to
     if body:
@@ -357,7 +417,7 @@ def move(ctx, entry_id, dest):
     """Move an email to another folder."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
-    msg = ns.GetItemFromID(entry_id)
+    msg = ns.GetItemFromID(_validate_entry_id(entry_id))
     target = get_folder(ns, dest)
     msg.Move(target)
     result = {"status": "moved", "destination": dest, "entry_id": entry_id}
@@ -372,7 +432,7 @@ def flag(ctx, entry_id, text):
     """Flag an email for follow-up."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
-    msg = ns.GetItemFromID(entry_id)
+    msg = ns.GetItemFromID(_validate_entry_id(entry_id))
     msg.FlagRequest = text
     msg.Save()
     result = {"status": "flagged", "flag": text, "entry_id": entry_id}
@@ -387,7 +447,7 @@ def mark_read(ctx, entry_id, unread):
     """Mark an email as read (or --unread)."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
-    msg = ns.GetItemFromID(entry_id)
+    msg = ns.GetItemFromID(_validate_entry_id(entry_id))
     msg.UnRead = unread
     msg.Save()
     state = "unread" if unread else "read"
@@ -403,7 +463,7 @@ def categorize(ctx, entry_id, categories):
     """Set categories on an email."""
     ol = get_outlook()
     ns = ol.GetNamespace("MAPI")
-    msg = ns.GetItemFromID(entry_id)
+    msg = ns.GetItemFromID(_validate_entry_id(entry_id))
     msg.Categories = categories
     msg.Save()
     result = {"status": "categorized", "categories": categories, "entry_id": entry_id}
@@ -541,7 +601,7 @@ def scrape(ctx, folder, count, fields):
                 elif attr == "Importance":
                     val = ["Low", "Normal", "High"][val]
                 else:
-                    val = str(val)
+                    val = _sanitize(str(val))
                 row[f] = val
             rows.append(row)
         except Exception:
@@ -577,11 +637,11 @@ def cal(ctx, days):
     for item in filtered:
         try:
             evt = {
-                "subject": item.Subject,
+                "subject": _sanitize(item.Subject),
                 "start": str(item.Start),
                 "end": str(item.End),
-                "location": item.Location,
-                "body": str(item.Body)[:200],
+                "location": _sanitize(item.Location),
+                "body": _sanitize(str(item.Body)[:200]),
             }
             results.append(evt)
         except Exception:
