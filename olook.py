@@ -15,6 +15,8 @@ if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+import html as html_mod
+
 import click
 import pythoncom
 import win32com.client
@@ -35,8 +37,9 @@ def _sanitize(s: str) -> str:
         return str(s)
     s = _ANSI_RE.sub('', s)
     s = ''.join(c for c in s if c not in _BIDI_CHARS)
-    # Strip C0 controls except tab (\x09) and newline (\x0a)
-    s = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', s)
+    # Strip C0 controls (except tab/newline) and C1 controls (U+0080-009F)
+    # C1 includes U+009B (CSI) which terminals interpret as ESC[
+    s = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]', '', s)
     return s
 
 
@@ -57,6 +60,8 @@ def _validate_entry_id(entry_id: str) -> str:
         )
     return entry_id
 
+
+_IMPORTANCE_MAP = {0: "Low", 1: "Normal", 2: "High"}
 
 # ── MAPI folder constants ──────────────────────────────────────────────
 
@@ -80,8 +85,11 @@ def _find_outlook_exe() -> str:
     """Locate OUTLOOK.EXE on disk. Fails if not found (no PATH fallback to avoid hijack)."""
     # Allow explicit override via environment variable
     env_exe = os.environ.get("OLOOK_OUTLOOK_EXE")
-    if env_exe and os.path.isfile(env_exe):
-        return env_exe
+    if env_exe:
+        if '"' in env_exe or '&' in env_exe or '|' in env_exe:
+            raise click.ClickException("OLOOK_OUTLOOK_EXE contains invalid characters")
+        if os.path.isfile(env_exe):
+            return env_exe
     for p in _OUTLOOK_PATHS:
         if os.path.isfile(p):
             return p
@@ -91,10 +99,21 @@ def _find_outlook_exe() -> str:
     )
 
 
+_com_initialized = False
+
+
+def _ensure_com():
+    """Initialize COM exactly once per process."""
+    global _com_initialized
+    if not _com_initialized:
+        pythoncom.CoInitialize()
+        _com_initialized = True
+
+
 def _is_outlook_running() -> bool:
     """Check if Outlook is registered in the COM Running Object Table."""
     try:
-        pythoncom.CoInitialize()
+        _ensure_com()
         win32com.client.GetActiveObject("Outlook.Application")
         return True
     except Exception:
@@ -121,7 +140,7 @@ def _launch_outlook_hidden():
 
 def get_outlook():
     """Connect to a running Outlook instance, or silently launch one."""
-    pythoncom.CoInitialize()
+    _ensure_com()
     try:
         return win32com.client.GetActiveObject("Outlook.Application")
     except Exception:
@@ -195,7 +214,7 @@ def format_msg(d: dict, compact: bool = False) -> str:
         f"From: {d.get('SenderName', '')} <{d.get('SenderEmailAddress', '')}>",
         f"Date: {d.get('ReceivedTime', '')}",
         f"Unread: {d.get('UnRead', '')}",
-        f"Importance: {['Low', 'Normal', 'High'][d.get('Importance', 1)]}",
+        f"Importance: {_IMPORTANCE_MAP.get(d.get('Importance', 1), 'Unknown')}",
         f"Categories: {d.get('Categories', '')}",
         f"Flag: {d.get('FlagRequest', '')}",
         f"Attachments: {d.get('Attachments', 0)}",
@@ -371,7 +390,7 @@ def reply(ctx, entry_id, body, reply_all):
     # Preserve HTML formatting if original is HTML (BodyFormat 2)
     try:
         if msg.BodyFormat == 2:  # olFormatHTML
-            r.HTMLBody = f"<p>{body}</p>" + r.HTMLBody
+            r.HTMLBody = f"<p>{html_mod.escape(body)}</p>" + r.HTMLBody
         else:
             r.Body = body + r.Body
     except Exception:
@@ -397,7 +416,7 @@ def forward(ctx, entry_id, to, body):
     if body:
         try:
             if msg.BodyFormat == 2:  # olFormatHTML
-                fwd.HTMLBody = f"<p>{body}</p>" + fwd.HTMLBody
+                fwd.HTMLBody = f"<p>{html_mod.escape(body)}</p>" + fwd.HTMLBody
             else:
                 fwd.Body = body + fwd.Body
         except Exception:
@@ -483,7 +502,7 @@ def folders(ctx, root):
 
     def walk(folder, prefix=""):
         try:
-            lines.append(f"{prefix}{folder.Name} ({folder.Items.Count})")
+            lines.append(f"{prefix}{_sanitize(folder.Name)} ({folder.Items.Count})")
             for i in range(folder.Folders.Count):
                 walk(folder.Folders.Item(i + 1), prefix + "  ")
         except Exception:
@@ -494,7 +513,7 @@ def folders(ctx, root):
     else:
         for store in ns.Stores:
             try:
-                lines.append(f"[{store.DisplayName}]")
+                lines.append(f"[{_sanitize(store.DisplayName)}]")
                 rf = store.GetRootFolder()
                 for i in range(rf.Folders.Count):
                     walk(rf.Folders.Item(i + 1), "  ")
@@ -534,7 +553,7 @@ def stats(ctx, folder):
         if count >= 500:
             break
         try:
-            name = msg.SenderName
+            name = _sanitize(str(msg.SenderName))
             senders[name] = senders.get(name, 0) + 1
             dt = str(msg.ReceivedTime)
             if newest is None:
@@ -599,7 +618,7 @@ def scrape(ctx, folder, count, fields):
                 elif attr == "Attachments":
                     val = val.Count if val else 0
                 elif attr == "Importance":
-                    val = ["Low", "Normal", "High"][val]
+                    val = _IMPORTANCE_MAP.get(val, f"Unknown({val})")
                 else:
                     val = _sanitize(str(val))
                 row[f] = val
@@ -725,7 +744,8 @@ def ghost(action):
             capture_output=True, text=True,
         )
         running = "YES" if _is_outlook_running() else "NO"
-        if result.returncode == 0 and task_name in result.stdout:
+        if result.returncode == 0:
+            # /tn provides exact match — returncode 0 means task exists
             click.echo("Ghost mode: ACTIVE")
         else:
             click.echo("Ghost mode: NOT INSTALLED")
